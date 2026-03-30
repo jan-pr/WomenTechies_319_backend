@@ -7,13 +7,15 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from WT_ComputePool.db import SessionLocal
-from WT_ComputePool.models import NodeStatus
+from WT_ComputePool.models import Job, NodeStatus
 from WT_ComputePool.repository import (
+    get_active_job_for_node,
     get_next_queued_job,
     list_nodes,
     list_reassignable_jobs_for_node,
     list_stale_nodes,
     mark_job_assigned_and_running,
+    mark_node_job,
     mark_node_status,
     requeue_job,
     serialize_job,
@@ -43,6 +45,7 @@ def assign_next_queued_job(db: Session) -> dict[str, Any]:
 
     node_id = result["node_id"]
     assigned_node = mark_node_status(db, node_id=node_id, status=NodeStatus.BUSY.value)
+    mark_node_job(db, node_id=node_id, job_id=job.id)
     mark_job_assigned_and_running(
         db,
         job=job,
@@ -64,6 +67,40 @@ def assign_all_queued_jobs(db: Session) -> list[dict[str, Any]]:
             break
         assignments.append(result)
     return assignments
+
+
+def poll_job_for_node(db, node_id: str):
+    print(f"[scheduler] polling job for node {node_id}")
+    existing_job = get_active_job_for_node(db, node_id=node_id)
+    if existing_job is not None:
+        print(f"[scheduler] node {node_id} already has active job {existing_job.id}")
+        return serialize_job(existing_job)
+
+    jobs = db.query(Job).order_by(Job.created_at.asc()).all()
+    print(
+        f"[scheduler] ALL JOBS: "
+        f"{[(job.id, job.status, job.assigned_node_id) for job in jobs]}"
+    )
+
+    job = (
+        db.query(Job)
+        .filter(Job.status == "queued")
+        .filter(Job.assigned_node_id.is_(None))
+        .order_by(Job.created_at.asc())
+        .first()
+    )
+
+    print(f"[scheduler] selected job: {job}")
+
+    if not job:
+        print("[scheduler] no queued jobs found")
+        return None
+
+    print(f"[scheduler] assigning job {job.id} to node {node_id}")
+    mark_node_status(db, node_id=node_id, status=NodeStatus.BUSY.value)
+    mark_node_job(db, node_id=node_id, job_id=job.id)
+    mark_job_assigned_and_running(db, job=job, node_id=node_id)
+    return serialize_job(job)
 
 
 def process_stale_nodes(db: Session) -> dict[str, Any]:

@@ -4,16 +4,17 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 import os
+import traceback
 import uuid
 
 from fastapi import Body, Depends, FastAPI, HTTPException
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from scheduler.carbon import fetch_carbon_intensity
 
-from WT_ComputePool.db import Base, engine, get_db
-from WT_ComputePool.models import Job, JobStatus, NodeStatus
+from scheduler.carbon import fetch_carbon_intensity
+from WT_ComputePool.db import get_database_debug_info, get_db, initialize_database
+from WT_ComputePool.models import JobStatus, NodeStatus
 from WT_ComputePool.repository import (
     clear_nonterminal_jobs,
     create_job,
@@ -27,16 +28,23 @@ from WT_ComputePool.repository import (
     requeue_job,
     serialize_job,
     serialize_node,
+    update_job_progress,
     upsert_node,
 )
-from WT_ComputePool.services import assign_next_queued_job, monitor_cluster_state, process_stale_nodes
+from WT_ComputePool.services import (
+    assign_next_queued_job,
+    monitor_cluster_state,
+    poll_job_for_node,
+    process_stale_nodes,
+)
+
 
 CARBON_API_KEY = os.getenv("ELECTRICITY_MAPS_API_KEY")
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    initialize_database()
     monitor_task = asyncio.create_task(monitor_cluster_state())
     try:
         yield
@@ -60,31 +68,38 @@ class NodeMetricsPayload(BaseModel):
 class NodeRegistrationPayload(BaseModel):
     node_id: str
     status: str = NodeStatus.IDLE.value
-    availability: str = NodeStatus.IDLE.value
     metrics: NodeMetricsPayload = Field(default_factory=NodeMetricsPayload)
     carbon_intensity: float | None = None
-    carbon_zone: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("carbon_zone", "zone"),
-    )
+    carbon_zone: str | None = None
     cpu: float | None = None
+    current_job_id: str | None = None
 
 
 class HeartbeatPayload(BaseModel):
     status: str | None = None
-    availability: str | None = None
     metrics: NodeMetricsPayload = Field(default_factory=NodeMetricsPayload)
     carbon_intensity: float | None = None
-    carbon_zone: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("carbon_zone", "zone"),
-    )
+    carbon_zone: str | None = None
     cpu: float | None = None
+    current_job_id: str | None = None
 
 
 class JobResultPayload(BaseModel):
     status: str
     reason: str | None = None
+
+
+class JobSubmissionPayload(BaseModel):
+    task_type: str = "demo_task"
+    payload: dict[str, object] = Field(default_factory=dict)
+
+
+class JobProgressPayload(BaseModel):
+    progress: int
+
+
+class JobCompletionPayload(BaseModel):
+    result: dict[str, object] | None = None
 
 
 def _build_node_record(
@@ -102,18 +117,17 @@ def _build_node_record(
 
     if payload is None:
         node_record["status"] = NodeStatus.IDLE.value
-        node_record["availability"] = NodeStatus.IDLE.value
     else:
         if payload.status is not None:
             node_record["status"] = payload.status
-        if payload.availability is not None:
-            node_record["availability"] = payload.availability
 
     if payload:
         if payload.carbon_intensity is not None:
             node_record["carbon_intensity"] = payload.carbon_intensity
         if payload.carbon_zone is not None:
             node_record["carbon_zone"] = payload.carbon_zone
+        if payload.current_job_id is not None:
+            node_record["current_job_id"] = payload.current_job_id
 
     return node_record
 
@@ -145,6 +159,7 @@ def _enrich_carbon_intensity(node_record: dict) -> dict:
 
     return node_record
 
+
 @app.get("/")
 def root():
     return {"message": "Backend running"}
@@ -153,7 +168,11 @@ def root():
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
-    return {"status": "OK", "database": "connected"}
+    return {
+        "status": "OK",
+        "database": "connected",
+        "database_debug": get_database_debug_info(),
+    }
 
 
 @app.post("/register-node")
@@ -169,10 +188,7 @@ def register_node(
     node_data = _enrich_carbon_intensity(
         _build_node_record(node_id=resolved_node_id, payload=payload),
     )
-    node = upsert_node(
-        db,
-        node_data,
-    )
+    node = upsert_node(db, node_data)
     db.commit()
     db.refresh(node)
 
@@ -186,6 +202,7 @@ def register_node(
 def debug(db: Session = Depends(get_db)):
     jobs = list_jobs(db)
     return {
+        "database_debug": get_database_debug_info(),
         "nodes": [serialize_node(node) for node in list_nodes(db)],
         "jobs": [serialize_job(job) for job in jobs],
         "queue": [
@@ -216,16 +233,27 @@ def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get
 
 
 @app.post("/submit-job")
-def submit_job(task_type: str = "demo_task", db: Session = Depends(get_db)):
+def submit_job(
+    task_type: str = "demo_task",
+    payload: JobSubmissionPayload | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
     job_id = str(uuid.uuid4())
-    job = create_job(db, job_id=job_id, task_type=task_type)
+    resolved_task_type = payload.task_type if payload else task_type
+    resolved_payload = payload.payload if payload else {}
+    job = create_job(
+        db,
+        job_id=job_id,
+        task_type=resolved_task_type,
+        payload=resolved_payload,
+    )
     db.commit()
     db.refresh(job)
 
     return {
         "message": "Job submitted",
         "job_id": job_id,
-        "task_type": task_type,
+        "task_type": resolved_task_type,
         "job": serialize_job(job),
     }
 
@@ -245,13 +273,73 @@ def assign_job(db: Session = Depends(get_db)):
     return result
 
 
-@app.post("/jobs/{job_id}/complete")
-def complete_job(job_id: str, db: Session = Depends(get_db)):
+@app.post("/nodes/{node_id}/poll-job")
+def poll_job(node_id: str, db: Session = Depends(get_db)):
+    print(f"[poll] polling job for node {node_id}")
+    try:
+        node = get_node(db, node_id)
+        if node is None:
+            print("[poll] node not found")
+            return {"job": None}
+
+        if node.status == NodeStatus.OFFLINE.value:
+            print("[poll] node offline")
+            return {"job": None}
+
+        job = poll_job_for_node(db, node_id=node_id)
+        if not job:
+            print("[poll] no job available")
+            return {"job": None}
+
+        print(f"[poll] job assigned: {job['id']}")
+        db.commit()
+        return {"job": job}
+    except Exception as exc:
+        db.rollback()
+        print(f"[poll] ERROR for node {node_id}: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="failed to poll job") from exc
+
+
+@app.post("/jobs/{job_id}/progress")
+def progress_job(
+    job_id: str,
+    payload: JobProgressPayload,
+    db: Session = Depends(get_db),
+):
     job = get_job(db, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
+        raise HTTPException(
+            status_code=409,
+            detail="job must be assigned or running before progress can be reported",
+        )
+
+    update_job_progress(db, job, payload.progress)
+    db.commit()
+    db.refresh(job)
+    return {"message": "Progress updated", "job": serialize_job(job)}
+
+
+@app.post("/jobs/{job_id}/complete")
+def complete_job(
+    job_id: str,
+    payload: JobCompletionPayload | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    job = get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
+        raise HTTPException(
+            status_code=409,
+            detail="job must be assigned or running before completion",
+        )
 
     assigned_node_id = job.assigned_node_id
+    if payload is not None:
+        job.result = payload.result
     mark_job_completed(db, job)
     if assigned_node_id:
         mark_node_status(db, node_id=assigned_node_id, status=NodeStatus.IDLE.value)
@@ -270,6 +358,11 @@ def fail_job(job_id: str, payload: JobResultPayload, db: Session = Depends(get_d
         raise HTTPException(
             status_code=400,
             detail="status must be either 'failed' or 'queued'",
+        )
+    if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
+        raise HTTPException(
+            status_code=409,
+            detail="job must be assigned or running before failure can be reported",
         )
 
     assigned_node_id = job.assigned_node_id

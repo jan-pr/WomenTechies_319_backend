@@ -77,7 +77,7 @@ def get_node_carbon_score(
     """Return a node carbon score from cached data or a fresh API lookup."""
     carbon_intensity = node.get("carbon_intensity")
     if carbon_intensity is None:
-        zone = node.get("carbon_zone") or node.get("zone")
+        zone = node.get("carbon_zone")
         if not zone:
             raise ValueError("node must include 'carbon_intensity' or a carbon zone")
         if not api_key:
