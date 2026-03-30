@@ -13,7 +13,7 @@ def serialize_node(node: Node) -> dict[str, Any]:
     return {
         "id": node.id,
         "status": node.status,
-        "availability": node.availability,
+        "availability": node.status,
         "metrics": {
             key: value
             for key, value in {
@@ -24,7 +24,7 @@ def serialize_node(node: Node) -> dict[str, Any]:
             if value is not None
         },
         "carbon_intensity": node.carbon_intensity,
-        "carbon_zone": node.carbon_zone or node.zone,
+        "carbon_zone": node.carbon_zone,
         "cpu": node.cpu,
         "last_seen": node.last_seen.isoformat() if node.last_seen else None,
     }
@@ -74,11 +74,10 @@ def upsert_node(db: Session, node_data: dict[str, Any]) -> Node:
         db.add(node)
 
     metrics = node_data.get("metrics", {})
-    node.status = node_data.get("status", node.status or NodeStatus.IDLE.value)
-    node.availability = node_data.get(
-        "availability",
-        node.availability or NodeStatus.IDLE.value,
-    )
+    resolved_status = node_data.get("status")
+    if resolved_status is None:
+        resolved_status = node_data.get("availability")
+    node.status = resolved_status or node.status or NodeStatus.IDLE.value
     node.success_rate = metrics.get("success_rate", node.success_rate)
     node.uptime = metrics.get("uptime", node.uptime)
     node.speed = metrics.get("speed", node.speed)
@@ -86,7 +85,6 @@ def upsert_node(db: Session, node_data: dict[str, Any]) -> Node:
     carbon_zone = node_data.get("carbon_zone")
     if carbon_zone is not None:
         node.carbon_zone = carbon_zone
-        node.zone = carbon_zone
     node.cpu = node_data.get("cpu", node.cpu)
     node.last_seen = datetime.utcnow()
     return node
@@ -156,6 +154,23 @@ def list_reassignable_jobs_for_node(db: Session, node_id: str) -> list[Job]:
         .order_by(Job.assigned_at.asc(), Job.started_at.asc(), Job.created_at.asc())
     )
     return list(db.scalars(statement))
+
+
+def node_has_active_jobs(
+    db: Session,
+    node_id: str,
+    exclude_job_id: str | None = None,
+) -> bool:
+    statement = (
+        select(Job)
+        .where(Job.assigned_node_id == node_id)
+        .where(Job.status.in_([JobStatus.ASSIGNED.value, JobStatus.RUNNING.value]))
+        .order_by(Job.created_at.asc())
+    )
+    jobs = list(db.scalars(statement))
+    if exclude_job_id is not None:
+        jobs = [job for job in jobs if job.id != exclude_job_id]
+    return bool(jobs)
 
 
 def mark_job_assigned_and_running(
@@ -230,7 +245,6 @@ def mark_node_status(db: Session, node_id: str, status: str) -> Node | None:
     if node is None:
         return None
     node.status = status
-    node.availability = status
     node.last_seen = datetime.utcnow()
     return node
 
@@ -254,7 +268,6 @@ def clear_nonterminal_jobs(db: Session) -> dict[str, Any]:
         if node is None or node.status == NodeStatus.OFFLINE.value:
             continue
         node.status = NodeStatus.IDLE.value
-        node.availability = NodeStatus.IDLE.value
         node.last_seen = datetime.utcnow()
         reset_nodes.append(node.id)
 

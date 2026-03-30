@@ -30,13 +30,11 @@ class Node(Base):
 
     id: Mapped[str] = mapped_column(String(255), primary_key=True)
     status: Mapped[str] = mapped_column(String(32), default=NodeStatus.IDLE.value)
-    availability: Mapped[str] = mapped_column(String(32), default=NodeStatus.IDLE.value)
     success_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     uptime: Mapped[float | None] = mapped_column(Float, nullable=True)
     speed: Mapped[float | None] = mapped_column(Float, nullable=True)
     carbon_intensity: Mapped[float | None] = mapped_column(Float, nullable=True)
     carbon_zone: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    zone: Mapped[str | None] = mapped_column(String(64), nullable=True)
     cpu: Mapped[float | None] = mapped_column(Float, nullable=True)
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

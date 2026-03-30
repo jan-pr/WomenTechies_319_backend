@@ -5,8 +5,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import os
 import uuid
-
-from fastapi import Body, Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -14,6 +14,7 @@ from scheduler.carbon import fetch_carbon_intensity
 
 from WT_ComputePool.db import Base, engine, get_db
 from WT_ComputePool.models import Job, JobStatus, NodeStatus
+from WT_ComputePool.redis_client import ASSIGNED_JOBS_KEY, enqueue_job, r
 from WT_ComputePool.repository import (
     clear_nonterminal_jobs,
     create_job,
@@ -24,14 +25,47 @@ from WT_ComputePool.repository import (
     mark_job_completed,
     mark_job_failed,
     mark_node_status,
+    node_has_active_jobs,
     requeue_job,
     serialize_job,
     serialize_node,
     upsert_node,
 )
-from WT_ComputePool.services import assign_next_queued_job, monitor_cluster_state, process_stale_nodes
+from WT_ComputePool.services import (
+    assign_next_queued_job,
+    monitor_cluster_state,
+    process_stale_nodes,
+    repair_redis_state,
+)
 
 CARBON_API_KEY = os.getenv("ELECTRICITY_MAPS_API_KEY")
+
+
+class WebSocketManager:
+    def __init__(self) -> None:
+        self.connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        if websocket in self.connections:
+            self.connections.remove(websocket)
+
+    async def broadcast(self, message: dict) -> None:
+        stale_connections: list[WebSocket] = []
+        for websocket in self.connections:
+            try:
+                await websocket.send_json(message)
+            except Exception:
+                stale_connections.append(websocket)
+
+        for websocket in stale_connections:
+            self.disconnect(websocket)
+
+
+ws_manager = WebSocketManager()
 
 
 @asynccontextmanager
@@ -50,7 +84,13 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # for development
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 class NodeMetricsPayload(BaseModel):
     success_rate: float | None = None
     uptime: float | None = None
@@ -199,6 +239,18 @@ def get_nodes(db: Session = Depends(get_db)):
     return {node.id: serialize_node(node) for node in list_nodes(db)}
 
 
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception:
+        ws_manager.disconnect(websocket)
+
+
 @app.post("/nodes/{node_id}/heartbeat")
 def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get_db)):
     existing_node = get_node(db, node_id)
@@ -207,6 +259,9 @@ def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get
         serialized_existing = serialize_node(existing_node)
         if serialized_existing.get("carbon_zone") and "carbon_zone" not in node_data:
             node_data["carbon_zone"] = serialized_existing["carbon_zone"]
+        if existing_node.status == NodeStatus.BUSY.value:
+            node_data.pop("status", None)
+            node_data.pop("availability", None)
 
     node_data = _enrich_carbon_intensity(node_data)
     node = upsert_node(db, node_data)
@@ -219,6 +274,7 @@ def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get
 def submit_job(task_type: str = "demo_task", db: Session = Depends(get_db)):
     job_id = str(uuid.uuid4())
     job = create_job(db, job_id=job_id, task_type=task_type)
+    enqueue_job(job_id)
     db.commit()
     db.refresh(job)
 
@@ -236,33 +292,50 @@ def get_jobs(db: Session = Depends(get_db)):
 
 
 @app.post("/assign-job")
-def assign_job(db: Session = Depends(get_db)):
+async def assign_job(db: Session = Depends(get_db)):
     result = assign_next_queued_job(db)
     if not result["assigned"]:
         return result
 
-    db.commit()
+    await ws_manager.broadcast(
+        {
+            "event": "job_assigned",
+            "job_id": result["job"]["id"],
+            "node_id": result["node"]["id"],
+        }
+    )
     return result
 
 
 @app.post("/jobs/{job_id}/complete")
-def complete_job(job_id: str, db: Session = Depends(get_db)):
+async def complete_job(job_id: str, db: Session = Depends(get_db)):
     job = get_job(db, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
 
     assigned_node_id = job.assigned_node_id
     mark_job_completed(db, job)
-    if assigned_node_id:
+    r.hdel(ASSIGNED_JOBS_KEY, job_id)
+    if assigned_node_id and not node_has_active_jobs(
+        db,
+        node_id=assigned_node_id,
+        exclude_job_id=job.id,
+    ):
         mark_node_status(db, node_id=assigned_node_id, status=NodeStatus.IDLE.value)
 
     db.commit()
     db.refresh(job)
+    await ws_manager.broadcast(
+        {
+            "event": "job_completed",
+            "job_id": job.id,
+        }
+    )
     return {"message": "Job completed", "job": serialize_job(job)}
 
 
 @app.post("/jobs/{job_id}/fail")
-def fail_job(job_id: str, payload: JobResultPayload, db: Session = Depends(get_db)):
+async def fail_job(job_id: str, payload: JobResultPayload, db: Session = Depends(get_db)):
     job = get_job(db, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
@@ -278,12 +351,25 @@ def fail_job(job_id: str, payload: JobResultPayload, db: Session = Depends(get_d
         mark_job_failed(db, job, reason=reason)
     else:
         requeue_job(db, job, reason=reason)
+        enqueue_job(job.id)
 
-    if assigned_node_id:
+    r.hdel(ASSIGNED_JOBS_KEY, job_id)
+    if assigned_node_id and not node_has_active_jobs(
+        db,
+        node_id=assigned_node_id,
+        exclude_job_id=job.id,
+    ):
         mark_node_status(db, node_id=assigned_node_id, status=NodeStatus.IDLE.value)
 
     db.commit()
     db.refresh(job)
+    if payload.status == JobStatus.FAILED.value:
+        await ws_manager.broadcast(
+            {
+                "event": "job_failed",
+                "job_id": job.id,
+            }
+        )
     return {"message": "Job updated", "job": serialize_job(job)}
 
 
@@ -297,5 +383,12 @@ def reconcile_cluster(db: Session = Depends(get_db)):
 @app.post("/debug/clear-nonterminal-jobs")
 def clear_active_jobs(db: Session = Depends(get_db)):
     result = clear_nonterminal_jobs(db)
+    db.commit()
+    return result
+
+
+@app.post("/debug/repair-redis-state")
+def repair_debug_redis_state(db: Session = Depends(get_db)):
+    result = repair_redis_state(db)
     db.commit()
     return result

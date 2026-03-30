@@ -31,6 +31,11 @@ def filter_idle_nodes(nodes: Sequence[Mapping[str, Any]]) -> list[Mapping[str, A
     return [node for node in nodes if is_node_idle(node)]
 
 
+def get_available_nodes(nodes: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """Return only nodes that are currently idle and available for scheduling."""
+    return filter_idle_nodes(nodes)
+
+
 def score_node(
     node: Mapping[str, Any],
     carbon_api_key: str | None = None,
@@ -64,8 +69,9 @@ def rank_nodes(
     weights: Mapping[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Rank idle nodes from best to worst based on trust and carbon scores."""
+    nodes = get_available_nodes(nodes)
     ranked_nodes: list[dict[str, Any]] = []
-    for node in filter_idle_nodes(nodes):
+    for node in nodes:
         scores = score_node(node, carbon_api_key=carbon_api_key, weights=weights)
         ranked_nodes.append(
             {
