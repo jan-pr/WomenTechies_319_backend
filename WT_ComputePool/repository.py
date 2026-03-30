@@ -24,8 +24,7 @@ def serialize_node(node: Node) -> dict[str, Any]:
             if value is not None
         },
         "carbon_intensity": node.carbon_intensity,
-        "carbon_zone": node.carbon_zone,
-        "zone": node.zone,
+        "carbon_zone": node.carbon_zone or node.zone,
         "cpu": node.cpu,
         "last_seen": node.last_seen.isoformat() if node.last_seen else None,
     }
@@ -84,8 +83,10 @@ def upsert_node(db: Session, node_data: dict[str, Any]) -> Node:
     node.uptime = metrics.get("uptime", node.uptime)
     node.speed = metrics.get("speed", node.speed)
     node.carbon_intensity = node_data.get("carbon_intensity", node.carbon_intensity)
-    node.carbon_zone = node_data.get("carbon_zone", node.carbon_zone)
-    node.zone = node_data.get("zone", node.zone)
+    carbon_zone = node_data.get("carbon_zone")
+    if carbon_zone is not None:
+        node.carbon_zone = carbon_zone
+        node.zone = carbon_zone
     node.cpu = node_data.get("cpu", node.cpu)
     node.last_seen = datetime.utcnow()
     return node

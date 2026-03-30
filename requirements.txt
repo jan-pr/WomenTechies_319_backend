@@ -1,6 +1,7 @@
 alembic
 fastapi
 pydantic
+python-dotenv
 requests
 sqlalchemy
 psycopg[binary]

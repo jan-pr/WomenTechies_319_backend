@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+import os
 import uuid
 
 from fastapi import Body, Depends, FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from scheduler.carbon import fetch_carbon_intensity
 
 from WT_ComputePool.db import Base, engine, get_db
 from WT_ComputePool.models import Job, JobStatus, NodeStatus
@@ -28,6 +30,8 @@ from WT_ComputePool.repository import (
     upsert_node,
 )
 from WT_ComputePool.services import assign_next_queued_job, monitor_cluster_state, process_stale_nodes
+
+CARBON_API_KEY = os.getenv("ELECTRICITY_MAPS_API_KEY")
 
 
 @asynccontextmanager
@@ -59,8 +63,10 @@ class NodeRegistrationPayload(BaseModel):
     availability: str = NodeStatus.IDLE.value
     metrics: NodeMetricsPayload = Field(default_factory=NodeMetricsPayload)
     carbon_intensity: float | None = None
-    carbon_zone: str | None = None
-    zone: str | None = None
+    carbon_zone: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("carbon_zone", "zone"),
+    )
     cpu: float | None = None
 
 
@@ -69,6 +75,10 @@ class HeartbeatPayload(BaseModel):
     availability: str | None = None
     metrics: NodeMetricsPayload = Field(default_factory=NodeMetricsPayload)
     carbon_intensity: float | None = None
+    carbon_zone: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("carbon_zone", "zone"),
+    )
     cpu: float | None = None
 
 
@@ -102,11 +112,36 @@ def _build_node_record(
     if payload:
         if payload.carbon_intensity is not None:
             node_record["carbon_intensity"] = payload.carbon_intensity
-        if isinstance(payload, NodeRegistrationPayload):
-            if payload.carbon_zone is not None:
-                node_record["carbon_zone"] = payload.carbon_zone
-            if payload.zone is not None:
-                node_record["zone"] = payload.zone
+        if payload.carbon_zone is not None:
+            node_record["carbon_zone"] = payload.carbon_zone
+
+    return node_record
+
+
+def _enrich_carbon_intensity(node_record: dict) -> dict:
+    carbon_intensity = node_record.get("carbon_intensity")
+    if carbon_intensity is not None and float(carbon_intensity) > 0:
+        return node_record
+
+    carbon_zone = node_record.get("carbon_zone")
+    if not carbon_zone:
+        return node_record
+    if not CARBON_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="ELECTRICITY_MAPS_API_KEY is not configured",
+        )
+
+    try:
+        node_record["carbon_intensity"] = fetch_carbon_intensity(
+            zone=str(carbon_zone),
+            api_key=CARBON_API_KEY,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"failed to fetch carbon intensity for zone '{carbon_zone}'",
+        ) from exc
 
     return node_record
 
@@ -131,9 +166,12 @@ def register_node(
     if not resolved_node_id:
         raise HTTPException(status_code=400, detail="node_id is required")
 
+    node_data = _enrich_carbon_intensity(
+        _build_node_record(node_id=resolved_node_id, payload=payload),
+    )
     node = upsert_node(
         db,
-        _build_node_record(node_id=resolved_node_id, payload=payload),
+        node_data,
     )
     db.commit()
     db.refresh(node)
@@ -167,10 +205,10 @@ def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get
     node_data = _build_node_record(node_id=node_id, payload=payload)
     if existing_node is not None:
         serialized_existing = serialize_node(existing_node)
-        for field in ("carbon_zone", "zone"):
-            if serialized_existing.get(field) and field not in node_data:
-                node_data[field] = serialized_existing[field]
+        if serialized_existing.get("carbon_zone") and "carbon_zone" not in node_data:
+            node_data["carbon_zone"] = serialized_existing["carbon_zone"]
 
+    node_data = _enrich_carbon_intensity(node_data)
     node = upsert_node(db, node_data)
     db.commit()
     db.refresh(node)
