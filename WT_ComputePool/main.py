@@ -4,16 +4,18 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 import os
+import traceback
 import uuid
-from fastapi.middleware.cors import CORSMiddleware
+
 from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from scheduler.carbon import fetch_carbon_intensity
 
-from WT_ComputePool.db import Base, engine, get_db
-from WT_ComputePool.models import Job, JobStatus, NodeStatus
+from scheduler.carbon import fetch_carbon_intensity
+from WT_ComputePool.db import SessionLocal, get_database_debug_info, get_db, initialize_database
+from WT_ComputePool.models import JobStatus, NodeStatus
 from WT_ComputePool.redis_client import ASSIGNED_JOBS_KEY, enqueue_job, r
 from WT_ComputePool.repository import (
     clear_nonterminal_jobs,
@@ -22,6 +24,7 @@ from WT_ComputePool.repository import (
     get_node,
     list_jobs,
     list_nodes,
+    list_reassignable_jobs_for_node,
     mark_job_completed,
     mark_job_failed,
     mark_node_status,
@@ -29,11 +32,13 @@ from WT_ComputePool.repository import (
     requeue_job,
     serialize_job,
     serialize_node,
+    update_job_progress,
     upsert_node,
 )
 from WT_ComputePool.services import (
     assign_next_queued_job,
     monitor_cluster_state,
+    poll_job_for_node,
     process_stale_nodes,
     repair_redis_state,
 )
@@ -70,7 +75,7 @@ ws_manager = WebSocketManager()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    Base.metadata.create_all(bind=engine)
+    initialize_database()
     monitor_task = asyncio.create_task(monitor_cluster_state())
     try:
         yield
@@ -86,11 +91,23 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for development
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 class NodeMetricsPayload(BaseModel):
     success_rate: float | None = None
     uptime: float | None = None
@@ -108,6 +125,7 @@ class NodeRegistrationPayload(BaseModel):
         validation_alias=AliasChoices("carbon_zone", "zone"),
     )
     cpu: float | None = None
+    current_job_id: str | None = None
 
 
 class HeartbeatPayload(BaseModel):
@@ -120,11 +138,25 @@ class HeartbeatPayload(BaseModel):
         validation_alias=AliasChoices("carbon_zone", "zone"),
     )
     cpu: float | None = None
+    current_job_id: str | None = None
 
 
 class JobResultPayload(BaseModel):
     status: str
     reason: str | None = None
+
+
+class JobSubmissionPayload(BaseModel):
+    task_type: str = "demo_task"
+    payload: dict[str, object] = Field(default_factory=dict)
+
+
+class JobProgressPayload(BaseModel):
+    progress: int
+
+
+class JobCompletionPayload(BaseModel):
+    result: dict[str, object] | None = None
 
 
 def _build_node_record(
@@ -154,6 +186,8 @@ def _build_node_record(
             node_record["carbon_intensity"] = payload.carbon_intensity
         if payload.carbon_zone is not None:
             node_record["carbon_zone"] = payload.carbon_zone
+        if payload.current_job_id is not None:
+            node_record["current_job_id"] = payload.current_job_id
 
     return node_record
 
@@ -164,26 +198,19 @@ def _enrich_carbon_intensity(node_record: dict) -> dict:
         return node_record
 
     carbon_zone = node_record.get("carbon_zone")
-    if not carbon_zone:
+    if not carbon_zone or not CARBON_API_KEY:
         return node_record
-    if not CARBON_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="ELECTRICITY_MAPS_API_KEY is not configured",
-        )
 
     try:
         node_record["carbon_intensity"] = fetch_carbon_intensity(
             zone=str(carbon_zone),
             api_key=CARBON_API_KEY,
         )
-    except (RuntimeError, ValueError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"failed to fetch carbon intensity for zone '{carbon_zone}'",
-        ) from exc
+    except RuntimeError:
+        node_record["carbon_intensity"] = None
 
     return node_record
+
 
 @app.get("/")
 def root():
@@ -193,7 +220,11 @@ def root():
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
-    return {"status": "OK", "database": "connected"}
+    return {
+        "status": "OK",
+        "database": "connected",
+        "database_debug": get_database_debug_info(),
+    }
 
 
 @app.post("/register-node")
@@ -209,10 +240,7 @@ def register_node(
     node_data = _enrich_carbon_intensity(
         _build_node_record(node_id=resolved_node_id, payload=payload),
     )
-    node = upsert_node(
-        db,
-        node_data,
-    )
+    node = upsert_node(db, node_data)
     db.commit()
     db.refresh(node)
 
@@ -226,6 +254,7 @@ def register_node(
 def debug(db: Session = Depends(get_db)):
     jobs = list_jobs(db)
     return {
+        "database_debug": get_database_debug_info(),
         "nodes": [serialize_node(node) for node in list_nodes(db)],
         "jobs": [serialize_job(job) for job in jobs],
         "queue": [
@@ -250,7 +279,25 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception:
         ws_manager.disconnect(websocket)
 
+@app.post("/nodes/{node_id}/stop")
+def stop_node(node_id: str):
+    db = SessionLocal()
+    try:
+        # mark node offline
+        mark_node_status(db, node_id=node_id, status="offline")
 
+        # reassign jobs
+        for job in list_reassignable_jobs_for_node(db, node_id=node_id):
+            requeue_job(
+                db,
+                job,
+                reason=f"node {node_id} stopped manually"
+            )
+
+        db.commit()
+        return {"message": f"node {node_id} stopped"}
+    finally:
+        db.close()
 @app.post("/nodes/{node_id}/heartbeat")
 def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get_db)):
     existing_node = get_node(db, node_id)
@@ -271,9 +318,20 @@ def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get
 
 
 @app.post("/submit-job")
-def submit_job(task_type: str = "demo_task", db: Session = Depends(get_db)):
+def submit_job(
+    task_type: str = "demo_task",
+    payload: JobSubmissionPayload | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
     job_id = str(uuid.uuid4())
-    job = create_job(db, job_id=job_id, task_type=task_type)
+    resolved_task_type = payload.task_type if payload else task_type
+    resolved_payload = payload.payload if payload else {}
+    job = create_job(
+        db,
+        job_id=job_id,
+        task_type=resolved_task_type,
+        payload=resolved_payload,
+    )
     enqueue_job(job_id)
     db.commit()
     db.refresh(job)
@@ -281,7 +339,7 @@ def submit_job(task_type: str = "demo_task", db: Session = Depends(get_db)):
     return {
         "message": "Job submitted",
         "job_id": job_id,
-        "task_type": task_type,
+        "task_type": resolved_task_type,
         "job": serialize_job(job),
     }
 
@@ -307,13 +365,66 @@ async def assign_job(db: Session = Depends(get_db)):
     return result
 
 
-@app.post("/jobs/{job_id}/complete")
-async def complete_job(job_id: str, db: Session = Depends(get_db)):
+@app.post("/nodes/{node_id}/poll-job")
+def poll_job(node_id: str, db: Session = Depends(get_db)):
+    print(f"[poll] polling job for node {node_id}")
+    try:
+        node = get_node(db, node_id)
+        if node is None or node.status == NodeStatus.OFFLINE.value:
+            return {"job": None}
+
+        job = poll_job_for_node(db, node_id=node_id)
+        if not job:
+            return {"job": None}
+
+        db.commit()
+        return {"job": job}
+    except Exception as exc:
+        db.rollback()
+        print(f"[poll] ERROR for node {node_id}: {exc}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="failed to poll job") from exc
+
+
+@app.post("/jobs/{job_id}/progress")
+def progress_job(
+    job_id: str,
+    payload: JobProgressPayload,
+    db: Session = Depends(get_db),
+):
     job = get_job(db, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
+        raise HTTPException(
+            status_code=409,
+            detail="job must be assigned or running before progress can be reported",
+        )
+
+    update_job_progress(db, job, payload.progress)
+    db.commit()
+    db.refresh(job)
+    return {"message": "Progress updated", "job": serialize_job(job)}
+
+
+@app.post("/jobs/{job_id}/complete")
+async def complete_job(
+    job_id: str,
+    payload: JobCompletionPayload | None = Body(default=None),
+    db: Session = Depends(get_db),
+):
+    job = get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
+        raise HTTPException(
+            status_code=409,
+            detail="job must be assigned or running before completion",
+        )
 
     assigned_node_id = job.assigned_node_id
+    if payload is not None:
+        job.result = payload.result
     mark_job_completed(db, job)
     r.hdel(ASSIGNED_JOBS_KEY, job_id)
     if assigned_node_id and not node_has_active_jobs(
@@ -343,6 +454,11 @@ async def fail_job(job_id: str, payload: JobResultPayload, db: Session = Depends
         raise HTTPException(
             status_code=400,
             detail="status must be either 'failed' or 'queued'",
+        )
+    if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
+        raise HTTPException(
+            status_code=409,
+            detail="job must be assigned or running before failure can be reported",
         )
 
     assigned_node_id = job.assigned_node_id

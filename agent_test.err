@@ -1,0 +1,20 @@
+Traceback (most recent call last):
+  File "C:\Users\janpr\WomenTechies_319_backend\agent.py", line 26, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "C:\Users\janpr\WomenTechies_319_backend\agent.py", line 22, in main
+    return module.main()
+           ^^^^^^^^^^^^^
+  File "C:\Users\janpr\WomenTechies_319_backend\agent\agent.py", line 183, in main
+    agent.run()
+  File "C:\Users\janpr\WomenTechies_319_backend\agent\agent.py", line 132, in run
+    self.register()
+  File "C:\Users\janpr\WomenTechies_319_backend\agent\agent.py", line 57, in register
+    response = register_node(self.config, node_data)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\janpr\WomenTechies_319_backend\agent\api_client.py", line 54, in register_node
+    response = _request(
+               ^^^^^^^^^
+  File "C:\Users\janpr\WomenTechies_319_backend\agent\api_client.py", line 49, in _request
+    raise RuntimeError(f"request failed after {MAX_RETRIES} attempts: {last_error}")
+RuntimeError: request failed after 3 attempts: POST http://127.0.0.1:8001/register-node failed with status 502: {"detail":"failed to fetch carbon intensity for zone 'JP'"}

@@ -11,7 +11,6 @@ def mark_node_busy(node: Mapping[str, Any]) -> dict[str, Any]:
     """Return a copy of a node marked as busy after job assignment."""
     updated_node = dict(node)
     updated_node["status"] = "busy"
-    updated_node["availability"] = "busy"
     return updated_node
 
 
@@ -19,7 +18,6 @@ def mark_node_idle(node: Mapping[str, Any]) -> dict[str, Any]:
     """Return a copy of a node marked idle after job completion or recovery."""
     updated_node = dict(node)
     updated_node["status"] = "idle"
-    updated_node["availability"] = "idle"
     return updated_node
 
 
@@ -46,7 +44,6 @@ def update_node_metrics_after_failure(
     updated_node = dict(node)
     updated_node["metrics"] = metrics
     updated_node["status"] = "idle"
-    updated_node["availability"] = "idle"
     return updated_node
 
 

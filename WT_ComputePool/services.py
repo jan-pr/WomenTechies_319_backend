@@ -7,7 +7,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from WT_ComputePool.db import SessionLocal
-from WT_ComputePool.models import JobStatus, NodeStatus
+from WT_ComputePool.models import Job, JobStatus, NodeStatus
 from WT_ComputePool.redis_client import (
     ASSIGNED_JOBS_KEY,
     JOB_QUEUE_KEY,
@@ -16,20 +16,21 @@ from WT_ComputePool.redis_client import (
     remove_job_from_queue,
 )
 from WT_ComputePool.repository import (
+    get_active_job_for_node,
     get_job,
     get_next_queued_job,
-    list_nonterminal_jobs,
     list_nodes,
+    list_nonterminal_jobs,
     list_reassignable_jobs_for_node,
     list_stale_nodes,
     mark_job_assigned_and_running,
+    mark_node_job,
     mark_node_status,
     requeue_job,
     serialize_job,
     serialize_node,
 )
 from scheduler.scheduler import assign_job_to_node
-
 
 HEARTBEAT_TIMEOUT_SECONDS = int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "60"))
 MONITOR_INTERVAL_SECONDS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "15"))
@@ -76,6 +77,7 @@ def assign_next_queued_job(db: Session) -> dict[str, Any]:
             if assigned_node is None:
                 raise RuntimeError(f"node '{node_id}' not found")
 
+            mark_node_job(db, node_id=node_id, job_id=job.id)
             mark_job_assigned_and_running(
                 db,
                 job=job,
@@ -106,6 +108,26 @@ def assign_all_queued_jobs(db: Session) -> list[dict[str, Any]]:
             break
         assignments.append(result)
     return assignments
+
+
+def poll_job_for_node(db: Session, node_id: str) -> dict[str, Any] | None:
+    existing_job = get_active_job_for_node(db, node_id=node_id)
+    if existing_job is not None:
+        return serialize_job(existing_job)
+
+    if node_id in r.hvals(ASSIGNED_JOBS_KEY):
+        return None
+
+    job = get_next_queued_job(db)
+    if job is None:
+        return None
+
+    mark_node_status(db, node_id=node_id, status=NodeStatus.BUSY.value)
+    mark_node_job(db, node_id=node_id, job_id=job.id)
+    mark_job_assigned_and_running(db, job=job, node_id=node_id)
+    remove_job_from_queue(job.id)
+    r.hset(ASSIGNED_JOBS_KEY, job.id, node_id)
+    return serialize_job(job)
 
 
 def process_stale_nodes(db: Session) -> dict[str, Any]:
@@ -181,8 +203,7 @@ def repair_redis_state(db: Session) -> dict[str, Any]:
     for job in list_nonterminal_jobs(db):
         if job.status == JobStatus.QUEUED.value:
             enqueue_job(job.id)
-            continue
-        if job.status in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
+        elif job.status in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
             remove_job_from_queue(job.id)
 
     return {

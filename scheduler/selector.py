@@ -17,13 +17,10 @@ DEFAULT_SELECTOR_WEIGHTS = {
 def is_node_idle(node: Mapping[str, Any]) -> bool:
     """Return True when a node is available for immediate scheduling."""
     status = node.get("status")
-    availability = node.get("availability")
 
     if status is not None and str(status).lower() != "idle":
         return False
-    if availability is not None and str(availability).lower() != "idle":
-        return False
-    return status is not None or availability is not None
+    return status is not None
 
 
 def filter_idle_nodes(nodes: Sequence[Mapping[str, Any]]) -> list[Mapping[str, Any]]:

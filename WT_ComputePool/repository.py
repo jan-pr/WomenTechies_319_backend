@@ -25,7 +25,9 @@ def serialize_node(node: Node) -> dict[str, Any]:
         },
         "carbon_intensity": node.carbon_intensity,
         "carbon_zone": node.carbon_zone,
+        "zone": node.carbon_zone,
         "cpu": node.cpu,
+        "current_job_id": node.current_job_id,
         "last_seen": node.last_seen.isoformat() if node.last_seen else None,
     }
 
@@ -34,6 +36,9 @@ def serialize_job(job: Job) -> dict[str, Any]:
     return {
         "id": job.id,
         "task_type": job.task_type,
+        "payload": job.payload or {},
+        "progress": job.progress,
+        "result": job.result,
         "status": job.status,
         "assigned_node": job.assigned_node_id,
         "failure_reason": job.failure_reason,
@@ -74,10 +79,8 @@ def upsert_node(db: Session, node_data: dict[str, Any]) -> Node:
         db.add(node)
 
     metrics = node_data.get("metrics", {})
-    resolved_status = node_data.get("status")
-    if resolved_status is None:
-        resolved_status = node_data.get("availability")
-    node.status = resolved_status or node.status or NodeStatus.IDLE.value
+    incoming_status = node_data.get("status")
+    node.status = incoming_status or node.status or NodeStatus.IDLE.value
     node.success_rate = metrics.get("success_rate", node.success_rate)
     node.uptime = metrics.get("uptime", node.uptime)
     node.speed = metrics.get("speed", node.speed)
@@ -86,6 +89,10 @@ def upsert_node(db: Session, node_data: dict[str, Any]) -> Node:
     if carbon_zone is not None:
         node.carbon_zone = carbon_zone
     node.cpu = node_data.get("cpu", node.cpu)
+    if "current_job_id" in node_data:
+        node.current_job_id = node_data["current_job_id"]
+    elif incoming_status is not None and incoming_status != NodeStatus.BUSY.value:
+        node.current_job_id = None
     node.last_seen = datetime.utcnow()
     return node
 
@@ -105,11 +112,18 @@ def list_stale_nodes(db: Session, stale_after_seconds: int) -> list[Node]:
     return list(db.scalars(statement))
 
 
-def create_job(db: Session, job_id: str, task_type: str) -> Job:
+def create_job(
+    db: Session,
+    job_id: str,
+    task_type: str,
+    payload: dict[str, Any] | None = None,
+) -> Job:
     now = datetime.utcnow()
     job = Job(
         id=job_id,
         task_type=task_type,
+        payload=payload or {},
+        progress=0,
         status=JobStatus.QUEUED.value,
         submitted_at=now,
         queued_at=now,
@@ -121,11 +135,26 @@ def create_job(db: Session, job_id: str, task_type: str) -> Job:
 
 
 def list_jobs(db: Session) -> list[Job]:
-    return list(db.scalars(select(Job).order_by(Job.created_at.desc())))
+    jobs = list(db.scalars(select(Job).order_by(Job.created_at.desc())))
+    print(
+        "[db] fetched jobs="
+        f"{[(job.id, job.status, job.assigned_node_id) for job in jobs]}"
+    )
+    return jobs
 
 
 def get_job(db: Session, job_id: str) -> Job | None:
     return db.get(Job, job_id)
+
+
+def get_active_job_for_node(db: Session, node_id: str) -> Job | None:
+    statement = (
+        select(Job)
+        .where(Job.assigned_node_id == node_id)
+        .where(Job.status.in_([JobStatus.ASSIGNED.value, JobStatus.RUNNING.value]))
+        .order_by(Job.assigned_at.desc(), Job.started_at.desc(), Job.created_at.desc())
+    )
+    return db.scalar(statement)
 
 
 def list_nonterminal_jobs(db: Session) -> list[Job]:
@@ -182,6 +211,7 @@ def mark_job_assigned_and_running(
     now = datetime.utcnow()
     job.assigned_node_id = node_id
     job.status = JobStatus.RUNNING.value
+    job.progress = 0
     job.assigned_at = now
     job.started_at = now
     job.failure_reason = None
@@ -203,6 +233,7 @@ def mark_job_assigned_and_running(
 def mark_job_completed(db: Session, job: Job) -> Job:
     now = datetime.utcnow()
     job.status = JobStatus.COMPLETED.value
+    job.progress = 100
     job.completed_at = now
     log_job_event(db, job_id=job.id, event_type=JobStatus.COMPLETED.value)
     return job
@@ -222,11 +253,29 @@ def mark_job_failed(db: Session, job: Job, reason: str) -> Job:
     return job
 
 
+def update_job_progress(db: Session, job: Job, progress: int) -> Job:
+    bounded_progress = max(0, min(100, int(progress)))
+    job.progress = bounded_progress
+    if bounded_progress > 0 and job.started_at is None:
+        job.started_at = datetime.utcnow()
+    if job.status == JobStatus.ASSIGNED.value:
+        job.status = JobStatus.RUNNING.value
+    log_job_event(
+        db,
+        job_id=job.id,
+        event_type="progress",
+        payload={"progress": bounded_progress},
+    )
+    return job
+
+
 def requeue_job(db: Session, job: Job, reason: str) -> Job:
     now = datetime.utcnow()
     job.status = JobStatus.QUEUED.value
     job.failure_reason = reason
     job.assigned_node_id = None
+    job.progress = 0
+    job.result = None
     job.queued_at = now
     job.assigned_at = None
     job.started_at = None
@@ -245,6 +294,17 @@ def mark_node_status(db: Session, node_id: str, status: str) -> Node | None:
     if node is None:
         return None
     node.status = status
+    if status != NodeStatus.BUSY.value:
+        node.current_job_id = None
+    node.last_seen = datetime.utcnow()
+    return node
+
+
+def mark_node_job(db: Session, node_id: str, job_id: str | None) -> Node | None:
+    node = db.get(Node, node_id)
+    if node is None:
+        return None
+    node.current_job_id = job_id
     node.last_seen = datetime.utcnow()
     return node
 
@@ -268,6 +328,7 @@ def clear_nonterminal_jobs(db: Session) -> dict[str, Any]:
         if node is None or node.status == NodeStatus.OFFLINE.value:
             continue
         node.status = NodeStatus.IDLE.value
+        node.current_job_id = None
         node.last_seen = datetime.utcnow()
         reset_nodes.append(node.id)
 

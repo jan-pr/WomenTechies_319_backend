@@ -77,7 +77,19 @@ def get_node_carbon_score(
     """Return a node carbon score from cached data or a fresh API lookup."""
     carbon_intensity = node.get("carbon_intensity")
     if carbon_intensity is None:
-        return 0.5
+        zone = node.get("carbon_zone") or node.get("zone")
+        if not zone:
+            return 0.5
+        if not api_key:
+            return 0.5
+        try:
+            carbon_intensity = fetch_carbon_intensity(
+                zone=str(zone),
+                api_key=api_key,
+                session=session,
+            )
+        except RuntimeError:
+            return 0.5
 
     return carbon_intensity_to_score(
         carbon_intensity=float(carbon_intensity),
