@@ -130,7 +130,12 @@ class WorkerAgent:
         print(f"[agent] starting job={job_id} task_type={task_type}")
 
         try:
-            result = execute_job(self.current_job, self._progress_callback)
+            result = execute_job(
+                self.current_job,
+                self._progress_callback,
+                sandbox_cpu_limit=self.config.sandbox_cpu_limit,
+                sandbox_memory_limit=self.config.sandbox_memory_limit,
+            )
             self.current_progress = 100
             self._report_terminal_state(complete_job, job_id, result)
             print(f"[agent] completed job={job_id} result={result}")

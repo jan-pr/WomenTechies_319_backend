@@ -21,6 +21,8 @@ class AgentConfig:
     carbon_zone: str | None = None
     heartbeat_interval_seconds: int = 5
     request_timeout_seconds: int = 10
+    sandbox_cpu_limit: str = "1.0"
+    sandbox_memory_limit: str = "512m"
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +41,8 @@ def load_config(cli_node_id: str | None = None) -> AgentConfig:
     backend_url = os.getenv("BACKEND_URL")
     node_id = cli_node_id or os.getenv("NODE_ID")
     carbon_zone = os.getenv("CARBON_ZONE")
+    sandbox_cpu_limit = os.getenv("SANDBOX_CPU_LIMIT", "1.0")
+    sandbox_memory_limit = os.getenv("SANDBOX_MEMORY_LIMIT", "512m")
 
     if not backend_url:
         raise ValueError("BACKEND_URL is required")
@@ -49,4 +53,6 @@ def load_config(cli_node_id: str | None = None) -> AgentConfig:
         backend_url=backend_url.rstrip("/"),
         node_id=node_id,
         carbon_zone=carbon_zone,
+        sandbox_cpu_limit=sandbox_cpu_limit,
+        sandbox_memory_limit=sandbox_memory_limit,
     )
