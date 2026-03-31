@@ -2,36 +2,59 @@
 
 from __future__ import annotations
 
-import os
+from collections.abc import Callable
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Any
+from typing import Any, TypedDict
 import uuid
 
 
-LANGUAGE_CONFIG: dict[str, dict[str, Any]] = {
+RunCommandFactory = Callable[[str], list[str]]
+InstallCommandFactory = Callable[[str | None, list[str]], str]
+
+
+class LanguageConfig(TypedDict):
+    image: str
+    run_command: RunCommandFactory
+    requirements_file: str
+    install_command: InstallCommandFactory
+
+
+def _python_run_command(entrypoint: str) -> list[str]:
+    return ["python", entrypoint]
+
+
+def _python_install_command(requirements_file: str | None, requirements: list[str]) -> str:
+    if not requirements or not requirements_file:
+        return ""
+    return f"python -m pip install --no-cache-dir -r {requirements_file}"
+
+
+def _node_run_command(entrypoint: str) -> list[str]:
+    return ["node", entrypoint]
+
+
+def _node_install_command(requirements_file: str | None, requirements: list[str]) -> str:
+    del requirements_file
+    if not requirements:
+        return ""
+    return "npm install --no-package-lock --omit=dev " + " ".join(requirements)
+
+
+LANGUAGE_CONFIG: dict[str, LanguageConfig] = {
     "python": {
         "image": "python:3.11-slim",
-        "run_command": lambda entrypoint: ["python", entrypoint],
+        "run_command": _python_run_command,
         "requirements_file": "requirements.txt",
-        "install_command": lambda requirements_file, requirements: (
-            f"python -m pip install --no-cache-dir -r {requirements_file}"
-            if requirements
-            else ""
-        ),
+        "install_command": _python_install_command,
     },
     "node": {
         "image": "node:20-alpine",
-        "run_command": lambda entrypoint: ["node", entrypoint],
+        "run_command": _node_run_command,
         "requirements_file": "package-deps.txt",
-        "install_command": lambda requirements_file, requirements: (
-            "npm install --no-package-lock --omit=dev "
-            + " ".join(requirements)
-            if requirements
-            else ""
-        ),
+        "install_command": _node_install_command,
     },
 }
 

@@ -5,8 +5,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import json
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import re
+import subprocess
+import sys
 import traceback
 import uuid
 
@@ -97,6 +99,42 @@ class WebSocketManager:
 
 
 ws_manager = WebSocketManager()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+AGENT_LOG_DIR = PROJECT_ROOT / "agent_logs"
+
+
+class LocalAgentManager:
+    def __init__(self) -> None:
+        self.processes: dict[str, subprocess.Popen[Any]] = {}
+
+    def ensure_agent(self, node_id: str) -> bool:
+        existing = self.processes.get(node_id)
+        if existing is not None and existing.poll() is None:
+            return False
+
+        self.processes.pop(node_id, None)
+        AGENT_LOG_DIR.mkdir(exist_ok=True)
+        log_handle = (AGENT_LOG_DIR / f"{node_id}.log").open("a", encoding="utf-8")
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        process = subprocess.Popen(
+            [sys.executable, str(PROJECT_ROOT / "agent.py"), "--node-id", node_id],
+            cwd=str(PROJECT_ROOT),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=creation_flags,
+        )
+        self.processes[node_id] = process
+        return True
+
+    def stop_agent(self, node_id: str) -> bool:
+        process = self.processes.pop(node_id, None)
+        if process is None or process.poll() is not None:
+            return False
+        process.terminate()
+        return True
+
+
+agent_manager = LocalAgentManager()
 
 
 @asynccontextmanager
@@ -206,6 +244,17 @@ def _resolve_job_submission(payload: JobSubmissionPayload | None, task_type: str
                 "timeout": payload.timeout or 30,
             },
         )
+
+    nested_payload = payload.payload if isinstance(payload.payload, dict) else {}
+    if payload.task_type == "demo_task":
+        if isinstance(nested_payload.get("code"), str) or isinstance(nested_payload.get("script_path"), str):
+            return "python_script", nested_payload
+        if (
+            isinstance(nested_payload.get("language"), str)
+            and isinstance(nested_payload.get("files"), dict)
+            and isinstance(nested_payload.get("entrypoint"), str)
+        ):
+            return "sandbox_code", nested_payload
 
     return payload.task_type, payload.payload
 
@@ -412,12 +461,18 @@ def register_node(
     if not resolved_node_id:
         raise HTTPException(status_code=400, detail="node_id is required")
 
-    node_data = _enrich_carbon_intensity(
-        _build_node_record(node_id=resolved_node_id, payload=payload),
-    )
+    existing_node = get_node(db, resolved_node_id)
+    node_data = _build_node_record(node_id=resolved_node_id, payload=payload)
+    if existing_node is not None and existing_node.status == NodeStatus.BUSY.value:
+        node_data.pop("status", None)
+        node_data.pop("availability", None)
+        node_data.pop("current_job_id", None)
+
+    node_data = _enrich_carbon_intensity(node_data)
     node = upsert_node(db, node_data)
     db.commit()
     db.refresh(node)
+    agent_manager.ensure_agent(resolved_node_id)
 
     return {
         "message": f"Node {resolved_node_id} registered",
@@ -470,6 +525,7 @@ def stop_node(node_id: str):
             )
 
         db.commit()
+        agent_manager.stop_agent(node_id)
         return {"message": f"node {node_id} stopped"}
     finally:
         db.close()
@@ -542,6 +598,7 @@ async def submit_code_job(
         task_type="sandbox_code",
         payload=normalized_payload,
     )
+    enqueue_job(job_id)
     db.commit()
     db.refresh(job)
 
@@ -563,6 +620,8 @@ async def assign_job(db: Session = Depends(get_db)):
     result = assign_next_queued_job(db)
     if not result["assigned"]:
         return result
+
+    agent_manager.ensure_agent(result["node"]["id"])
 
     await ws_manager.broadcast(
         {
@@ -596,7 +655,7 @@ def poll_job(node_id: str, db: Session = Depends(get_db)):
 
 
 @app.post("/jobs/{job_id}/progress")
-def progress_job(
+async def progress_job(
     job_id: str,
     payload: JobProgressPayload,
     db: Session = Depends(get_db),
@@ -613,7 +672,23 @@ def progress_job(
     update_job_progress(db, job, payload.progress)
     db.commit()
     db.refresh(job)
+    await ws_manager.broadcast(
+        {
+            "event": "job_progress",
+            "job_id": job.id,
+            "progress": job.progress,
+            "node_id": job.assigned_node_id,
+        }
+    )
     return {"message": "Progress updated", "job": serialize_job(job)}
+
+
+@app.get("/debug/agent-logs/{node_id}")
+def get_agent_log(node_id: str):
+    log_path = AGENT_LOG_DIR / f"{node_id}.log"
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail="agent log not found")
+    return {"node_id": node_id, "log": log_path.read_text(encoding="utf-8")}
 
 
 @app.post("/jobs/{job_id}/complete")
