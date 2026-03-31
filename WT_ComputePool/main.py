@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
+import json
 import os
+from pathlib import PurePosixPath
+import re
 import traceback
 import uuid
 
-from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, File, Form,UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import text
@@ -44,6 +47,29 @@ from WT_ComputePool.services import (
 )
 
 CARBON_API_KEY = os.getenv("ELECTRICITY_MAPS_API_KEY")
+MAX_UPLOAD_FILES = 25
+MAX_FILE_BYTES = 512 * 1024
+MAX_TOTAL_UPLOAD_BYTES = 2 * 1024 * 1024
+MAX_REQUIREMENTS = 100
+DEFAULT_CODE_TIMEOUT_SECONDS = 30
+MAX_CODE_TIMEOUT_SECONDS = 3600
+SUPPORTED_CODE_LANGUAGES = {"python", "node"}
+ALLOWED_SOURCE_EXTENSIONS = {
+    ".py",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".json",
+    ".txt",
+    ".md",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".env",
+}
+SAFE_REQUIREMENT_PATTERN = re.compile(r"^[A-Za-z0-9._+\-<>=!~\[\]]+$")
 
 
 class WebSocketManager:
@@ -149,6 +175,11 @@ class JobResultPayload(BaseModel):
 class JobSubmissionPayload(BaseModel):
     task_type: str = "demo_task"
     payload: dict[str, object] = Field(default_factory=dict)
+    language: str | None = None
+    files: dict[str, str] | None = None
+    requirements: list[str] | None = None
+    entrypoint: str | None = None
+    timeout: int | None = None
 
 
 class JobProgressPayload(BaseModel):
@@ -157,6 +188,150 @@ class JobProgressPayload(BaseModel):
 
 class JobCompletionPayload(BaseModel):
     result: dict[str, object] | None = None
+
+
+def _resolve_job_submission(payload: JobSubmissionPayload | None, task_type: str) -> tuple[str, dict[str, object]]:
+    """Support both legacy task payloads and newer arbitrary-code submissions."""
+    if payload is None:
+        return task_type, {}
+
+    if payload.language and payload.files and payload.entrypoint:
+        return (
+            "sandbox_code",
+            {
+                "language": payload.language,
+                "files": payload.files,
+                "requirements": payload.requirements or [],
+                "entrypoint": payload.entrypoint,
+                "timeout": payload.timeout or 30,
+            },
+        )
+
+    return payload.task_type, payload.payload
+
+
+def _validate_relative_source_path(path_value: str) -> str:
+    normalized = PurePosixPath(path_value.replace("\\", "/"))
+    if normalized.is_absolute() or ".." in normalized.parts:
+        raise HTTPException(status_code=400, detail=f"invalid file path: {path_value}")
+    if not normalized.name:
+        raise HTTPException(status_code=400, detail=f"invalid file path: {path_value}")
+    suffix = normalized.suffix.lower()
+    if suffix and suffix not in ALLOWED_SOURCE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported file type for upload: {normalized.name}",
+        )
+    return normalized.as_posix()
+
+
+def _parse_requirements_text(raw_requirements: str | None) -> list[str]:
+    if not raw_requirements:
+        return []
+
+    parsed: object
+    try:
+        parsed = json.loads(raw_requirements)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, list):
+        candidates = parsed
+    else:
+        separators_normalized = raw_requirements.replace("\r\n", "\n").replace(",", "\n")
+        candidates = [line.strip() for line in separators_normalized.split("\n")]
+
+    cleaned: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, str):
+            raise HTTPException(status_code=400, detail="requirements must be strings")
+        requirement = candidate.strip()
+        if not requirement:
+            continue
+        if not SAFE_REQUIREMENT_PATTERN.match(requirement):
+            raise HTTPException(
+                status_code=400,
+                detail=f"invalid requirement entry: {requirement}",
+            )
+        cleaned.append(requirement)
+
+    if len(cleaned) > MAX_REQUIREMENTS:
+        raise HTTPException(status_code=400, detail="too many requirements")
+    return cleaned
+
+
+async def _normalize_uploaded_code_job(
+    *,
+    language: str,
+    entrypoint: str,
+    timeout: int,
+    requirements_text: str | None,
+    uploads: list[UploadFile],
+) -> dict[str, object]:
+    normalized_language = language.strip().lower()
+    if normalized_language not in SUPPORTED_CODE_LANGUAGES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported language: {normalized_language}",
+        )
+    if timeout <= 0 or timeout > MAX_CODE_TIMEOUT_SECONDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"timeout must be between 1 and {MAX_CODE_TIMEOUT_SECONDS} seconds",
+        )
+    if not uploads:
+        raise HTTPException(status_code=400, detail="at least one source file is required")
+    if len(uploads) > MAX_UPLOAD_FILES:
+        raise HTTPException(status_code=400, detail="too many uploaded files")
+
+    normalized_entrypoint = _validate_relative_source_path(entrypoint)
+    files: dict[str, str] = {}
+    total_bytes = 0
+
+    for upload in uploads:
+        if not upload.filename:
+            raise HTTPException(status_code=400, detail="uploaded file is missing a filename")
+        normalized_path = _validate_relative_source_path(upload.filename)
+        if normalized_path in files:
+            raise HTTPException(
+                status_code=400,
+                detail=f"duplicate uploaded file path: {normalized_path}",
+            )
+
+        content_bytes = await upload.read()
+        total_bytes += len(content_bytes)
+        if len(content_bytes) > MAX_FILE_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"file too large: {normalized_path}",
+            )
+        if total_bytes > MAX_TOTAL_UPLOAD_BYTES:
+            raise HTTPException(status_code=400, detail="total upload size exceeded")
+
+        try:
+            decoded = content_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"file must be utf-8 text: {normalized_path}",
+            ) from exc
+
+        files[normalized_path] = decoded
+
+    if normalized_entrypoint not in files:
+        raise HTTPException(
+            status_code=400,
+            detail=f"entrypoint '{normalized_entrypoint}' was not uploaded",
+        )
+
+    requirements = _parse_requirements_text(requirements_text)
+    return {
+        "language": normalized_language,
+        "files": files,
+        "requirements": requirements,
+        "entrypoint": normalized_entrypoint,
+        "timeout": timeout,
+    }
 
 
 def _build_node_record(
@@ -324,8 +499,7 @@ def submit_job(
     db: Session = Depends(get_db),
 ):
     job_id = str(uuid.uuid4())
-    resolved_task_type = payload.task_type if payload else task_type
-    resolved_payload = payload.payload if payload else {}
+    resolved_task_type, resolved_payload = _resolve_job_submission(payload, task_type)
     job = create_job(
         db,
         job_id=job_id,
@@ -340,6 +514,41 @@ def submit_job(
         "message": "Job submitted",
         "job_id": job_id,
         "task_type": resolved_task_type,
+        "job": serialize_job(job),
+    }
+
+
+@app.post("/submit-code-job")
+async def submit_code_job(
+    language: str = Form(...),
+    entrypoint: str = Form(...),
+    timeout: int = Form(DEFAULT_CODE_TIMEOUT_SECONDS),
+    requirements: str | None = Form(default=None),
+    files: list[UploadFile] = File(...),
+    db: Session = Depends(get_db),
+):
+    normalized_payload = await _normalize_uploaded_code_job(
+        language=language,
+        entrypoint=entrypoint,
+        timeout=timeout,
+        requirements_text=requirements,
+        uploads=files,
+    )
+
+    job_id = str(uuid.uuid4())
+    job = create_job(
+        db,
+        job_id=job_id,
+        task_type="sandbox_code",
+        payload=normalized_payload,
+    )
+    db.commit()
+    db.refresh(job)
+
+    return {
+        "message": "Code job submitted",
+        "job_id": job_id,
+        "task_type": "sandbox_code",
         "job": serialize_job(job),
     }
 

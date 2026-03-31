@@ -7,3 +7,4 @@ requests
 sqlalchemy
 psycopg[binary]
 uvicorn
+python-multipart
