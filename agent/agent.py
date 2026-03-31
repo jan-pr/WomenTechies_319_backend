@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import atexit
+from pathlib import Path
 import signal
+import sys
 import time
 from typing import Any
 
@@ -30,6 +33,34 @@ except ModuleNotFoundError:  # pragma: no cover - script execution fallback
     from executor import execute_job
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+AGENT_LOG_DIR = PROJECT_ROOT / "agent_logs"
+
+
+class _TeeStream:
+    def __init__(self, *streams: Any) -> None:
+        self.streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
+def _configure_agent_logging(node_id: str) -> None:
+    AGENT_LOG_DIR.mkdir(exist_ok=True)
+    log_path = AGENT_LOG_DIR / f"{node_id}.log"
+    log_handle = log_path.open("a", encoding="utf-8")
+    atexit.register(log_handle.close)
+    sys.stdout = _TeeStream(sys.__stdout__, log_handle)
+    sys.stderr = _TeeStream(sys.__stderr__, log_handle)
+
+
 class WorkerAgent:
     """A production-style single-threaded worker that processes one job at a time."""
 
@@ -39,6 +70,15 @@ class WorkerAgent:
         self.current_progress = 0
         self.running = True
         self.last_heartbeat_at = 0.0
+
+    @staticmethod
+    def _should_stop_for_backend_error(exc: Exception) -> bool:
+        error_text = str(exc).lower()
+        return (
+            "stale agent session" in error_text
+            or "node not registered" in error_text
+            or "status 404" in error_text
+        )
 
     def register(self) -> None:
         """Register this worker with the backend."""
@@ -54,6 +94,7 @@ class WorkerAgent:
             "cpu": 0,
         }
         response = register_node(self.config, node_data)
+        self.config.session_token = response.get("session_token")
         print(f"[agent] registered node {self.config.node_id}: {response}")
 
     def send_status_heartbeat(self, status: str) -> None:
@@ -98,6 +139,10 @@ class WorkerAgent:
         try:
             report_progress(self.config, job_id, progress)
         except Exception as exc:
+            if self._should_stop_for_backend_error(exc):
+                print(f"[agent] stopping after progress rejection: {exc}")
+                self.running = False
+                return
             print(f"[agent] progress reporting failed for job={job_id}: {exc}")
 
         self._maybe_send_heartbeat("busy")
@@ -109,6 +154,24 @@ class WorkerAgent:
                 reporter(self.config, job_id, payload)
                 return
             except Exception as exc:
+                error_text = str(exc)
+                if self._should_stop_for_backend_error(exc):
+                    print(
+                        f"[agent] stopping terminal reporting for node={self.config.node_id}: {exc}"
+                    )
+                    self.running = False
+                    return
+                if (
+                    " 404:" in error_text
+                    or "status 404" in error_text
+                    or "already finished" in error_text.lower()
+                    or "already completed" in error_text.lower()
+                    or "status 409" in error_text
+                ):
+                    print(
+                        f"[agent] terminal state already settled for job={job_id}: {exc}"
+                    )
+                    return
                 print(f"[agent] terminal reporting failed for job={job_id}: {exc}")
                 time.sleep(2)
 
@@ -151,7 +214,14 @@ class WorkerAgent:
     def run(self) -> None:
         """Run the main worker loop."""
         self.register()
-        self.send_status_heartbeat("idle")
+        try:
+            self.send_status_heartbeat("idle")
+        except Exception as exc:
+            if self._should_stop_for_backend_error(exc):
+                print(f"[agent] stopping after initial heartbeat failed: {exc}")
+                self.running = False
+            else:
+                raise
 
         while self.running:
             try:
@@ -176,6 +246,12 @@ class WorkerAgent:
 
                 self._execute_current_job()
             except Exception as exc:
+                if self._should_stop_for_backend_error(exc):
+                    print(
+                        f"[agent] stopping worker for node={self.config.node_id}: {exc}"
+                    )
+                    self.running = False
+                    break
                 print(f"[agent] main loop error: {exc}")
                 time.sleep(2)
 
@@ -205,6 +281,7 @@ def main() -> int:
     """CLI entrypoint for the worker agent."""
     args = parse_args()
     config = load_config(cli_node_id=args.node_id)
+    _configure_agent_logging(config.node_id)
     agent = WorkerAgent(config)
 
     def _handle_signal(signum, _frame) -> None:

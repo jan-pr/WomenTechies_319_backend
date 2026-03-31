@@ -18,6 +18,7 @@ class AgentConfig:
 
     backend_url: str
     node_id: str
+    session_token: str | None = None
     carbon_zone: str | None = None
     heartbeat_interval_seconds: int = 5
     request_timeout_seconds: int = 10

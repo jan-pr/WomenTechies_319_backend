@@ -7,12 +7,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import subprocess
-import sys
 import traceback
 import uuid
 
-from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, File, Form,UploadFile
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect, File, Form,UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import text
@@ -21,7 +19,13 @@ from sqlalchemy.orm import Session
 from scheduler.carbon import fetch_carbon_intensity
 from WT_ComputePool.db import SessionLocal, get_database_debug_info, get_db, initialize_database
 from WT_ComputePool.models import JobStatus, NodeStatus
-from WT_ComputePool.redis_client import ASSIGNED_JOBS_KEY, enqueue_job, r
+from WT_ComputePool.redis_client import (
+    ASSIGNED_JOBS_KEY,
+    enqueue_job,
+    get_node_session,
+    r,
+    set_node_session,
+)
 from WT_ComputePool.repository import (
     clear_nonterminal_jobs,
     create_job,
@@ -101,40 +105,6 @@ class WebSocketManager:
 ws_manager = WebSocketManager()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 AGENT_LOG_DIR = PROJECT_ROOT / "agent_logs"
-
-
-class LocalAgentManager:
-    def __init__(self) -> None:
-        self.processes: dict[str, subprocess.Popen[Any]] = {}
-
-    def ensure_agent(self, node_id: str) -> bool:
-        existing = self.processes.get(node_id)
-        if existing is not None and existing.poll() is None:
-            return False
-
-        self.processes.pop(node_id, None)
-        AGENT_LOG_DIR.mkdir(exist_ok=True)
-        log_handle = (AGENT_LOG_DIR / f"{node_id}.log").open("a", encoding="utf-8")
-        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        process = subprocess.Popen(
-            [sys.executable, str(PROJECT_ROOT / "agent.py"), "--node-id", node_id],
-            cwd=str(PROJECT_ROOT),
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            creationflags=creation_flags,
-        )
-        self.processes[node_id] = process
-        return True
-
-    def stop_agent(self, node_id: str) -> bool:
-        process = self.processes.pop(node_id, None)
-        if process is None or process.poll() is not None:
-            return False
-        process.terminate()
-        return True
-
-
-agent_manager = LocalAgentManager()
 
 
 @asynccontextmanager
@@ -226,6 +196,41 @@ class JobProgressPayload(BaseModel):
 
 class JobCompletionPayload(BaseModel):
     result: dict[str, object] | None = None
+
+
+def _issue_node_session(node_id: str) -> str:
+    session_token = uuid.uuid4().hex
+    set_node_session(node_id, session_token)
+    return session_token
+
+
+def _require_node_session(node_id: str, node_session_token: str | None) -> None:
+    expected = get_node_session(node_id)
+    if expected is None:
+        return
+    if not node_session_token or node_session_token != expected:
+        raise HTTPException(status_code=409, detail="stale agent session")
+
+
+def _release_node_if_job_finished(
+    db: Session,
+    *,
+    node_id: str | None,
+    job_id: str,
+) -> None:
+    if not node_id:
+        return
+
+    r.hdel(ASSIGNED_JOBS_KEY, job_id)
+    node = get_node(db, node_id)
+    if node is None:
+        return
+    if node.current_job_id == job_id or not node_has_active_jobs(
+        db,
+        node_id=node_id,
+        exclude_job_id=job_id,
+    ):
+        mark_node_status(db, node_id=node_id, status=NodeStatus.IDLE.value)
 
 
 def _resolve_job_submission(payload: JobSubmissionPayload | None, task_type: str) -> tuple[str, dict[str, object]]:
@@ -472,10 +477,11 @@ def register_node(
     node = upsert_node(db, node_data)
     db.commit()
     db.refresh(node)
-    agent_manager.ensure_agent(resolved_node_id)
+    session_token = _issue_node_session(resolved_node_id)
 
     return {
         "message": f"Node {resolved_node_id} registered",
+        "session_token": session_token,
         "node": serialize_node(node),
     }
 
@@ -513,6 +519,8 @@ async def websocket_endpoint(websocket: WebSocket):
 def stop_node(node_id: str):
     db = SessionLocal()
     try:
+        set_node_session(node_id, str(uuid.uuid4()))
+
         # mark node offline
         mark_node_status(db, node_id=node_id, status="offline")
 
@@ -525,19 +533,29 @@ def stop_node(node_id: str):
             )
 
         db.commit()
-        agent_manager.stop_agent(node_id)
         return {"message": f"node {node_id} stopped"}
     finally:
         db.close()
 @app.post("/nodes/{node_id}/heartbeat")
-def heartbeat(node_id: str, payload: HeartbeatPayload, db: Session = Depends(get_db)):
+def heartbeat(
+    node_id: str,
+    payload: HeartbeatPayload,
+    db: Session = Depends(get_db),
+    x_node_session_token: str | None = Header(default=None),
+):
+    _require_node_session(node_id, x_node_session_token)
     existing_node = get_node(db, node_id)
+    if existing_node is None:
+        raise HTTPException(status_code=404, detail="node not registered")
     node_data = _build_node_record(node_id=node_id, payload=payload)
     if existing_node is not None:
         serialized_existing = serialize_node(existing_node)
         if serialized_existing.get("carbon_zone") and "carbon_zone" not in node_data:
             node_data["carbon_zone"] = serialized_existing["carbon_zone"]
-        if existing_node.status == NodeStatus.BUSY.value:
+        if existing_node.status in {
+            NodeStatus.BUSY.value,
+            NodeStatus.OFFLINE.value,
+        }:
             node_data.pop("status", None)
             node_data.pop("availability", None)
 
@@ -621,8 +639,6 @@ async def assign_job(db: Session = Depends(get_db)):
     if not result["assigned"]:
         return result
 
-    agent_manager.ensure_agent(result["node"]["id"])
-
     await ws_manager.broadcast(
         {
             "event": "job_assigned",
@@ -634,11 +650,18 @@ async def assign_job(db: Session = Depends(get_db)):
 
 
 @app.post("/nodes/{node_id}/poll-job")
-def poll_job(node_id: str, db: Session = Depends(get_db)):
+def poll_job(
+    node_id: str,
+    db: Session = Depends(get_db),
+    x_node_session_token: str | None = Header(default=None),
+):
+    _require_node_session(node_id, x_node_session_token)
     print(f"[poll] polling job for node {node_id}")
     try:
         node = get_node(db, node_id)
-        if node is None or node.status == NodeStatus.OFFLINE.value:
+        if node is None:
+            raise HTTPException(status_code=404, detail="node not registered")
+        if node.status == NodeStatus.OFFLINE.value:
             return {"job": None}
 
         job = poll_job_for_node(db, node_id=node_id)
@@ -659,10 +682,23 @@ async def progress_job(
     job_id: str,
     payload: JobProgressPayload,
     db: Session = Depends(get_db),
+    x_node_id: str | None = Header(default=None),
+    x_node_session_token: str | None = Header(default=None),
 ):
+    if x_node_id:
+        _require_node_session(x_node_id, x_node_session_token)
     job = get_job(db, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
+    if job.status in {JobStatus.COMPLETED.value, JobStatus.FAILED.value}:
+        _release_node_if_job_finished(
+            db,
+            node_id=job.assigned_node_id,
+            job_id=job.id,
+        )
+        db.commit()
+        db.refresh(job)
+        return {"message": "Job already finished", "job": serialize_job(job)}
     if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
         raise HTTPException(
             status_code=409,
@@ -696,10 +732,23 @@ async def complete_job(
     job_id: str,
     payload: JobCompletionPayload | None = Body(default=None),
     db: Session = Depends(get_db),
+    x_node_id: str | None = Header(default=None),
+    x_node_session_token: str | None = Header(default=None),
 ):
+    if x_node_id:
+        _require_node_session(x_node_id, x_node_session_token)
     job = get_job(db, job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
+        return {"message": "Job already settled", "job_id": job_id}
+    if job.status == JobStatus.COMPLETED.value:
+        _release_node_if_job_finished(
+            db,
+            node_id=job.assigned_node_id,
+            job_id=job.id,
+        )
+        db.commit()
+        db.refresh(job)
+        return {"message": "Job already completed", "job": serialize_job(job)}
     if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
         raise HTTPException(
             status_code=409,
@@ -710,13 +759,11 @@ async def complete_job(
     if payload is not None:
         job.result = payload.result
     mark_job_completed(db, job)
-    r.hdel(ASSIGNED_JOBS_KEY, job_id)
-    if assigned_node_id and not node_has_active_jobs(
+    _release_node_if_job_finished(
         db,
         node_id=assigned_node_id,
-        exclude_job_id=job.id,
-    ):
-        mark_node_status(db, node_id=assigned_node_id, status=NodeStatus.IDLE.value)
+        job_id=job.id,
+    )
 
     db.commit()
     db.refresh(job)
@@ -730,15 +777,32 @@ async def complete_job(
 
 
 @app.post("/jobs/{job_id}/fail")
-async def fail_job(job_id: str, payload: JobResultPayload, db: Session = Depends(get_db)):
+async def fail_job(
+    job_id: str,
+    payload: JobResultPayload,
+    db: Session = Depends(get_db),
+    x_node_id: str | None = Header(default=None),
+    x_node_session_token: str | None = Header(default=None),
+):
+    if x_node_id:
+        _require_node_session(x_node_id, x_node_session_token)
     job = get_job(db, job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="job not found")
+        return {"message": "Job already settled", "job_id": job_id}
     if payload.status not in {JobStatus.FAILED.value, JobStatus.QUEUED.value}:
         raise HTTPException(
             status_code=400,
             detail="status must be either 'failed' or 'queued'",
         )
+    if job.status in {JobStatus.COMPLETED.value, JobStatus.FAILED.value}:
+        _release_node_if_job_finished(
+            db,
+            node_id=job.assigned_node_id,
+            job_id=job.id,
+        )
+        db.commit()
+        db.refresh(job)
+        return {"message": "Job already finished", "job": serialize_job(job)}
     if job.status not in {JobStatus.ASSIGNED.value, JobStatus.RUNNING.value}:
         raise HTTPException(
             status_code=409,
@@ -753,13 +817,11 @@ async def fail_job(job_id: str, payload: JobResultPayload, db: Session = Depends
         requeue_job(db, job, reason=reason)
         enqueue_job(job.id)
 
-    r.hdel(ASSIGNED_JOBS_KEY, job_id)
-    if assigned_node_id and not node_has_active_jobs(
+    _release_node_if_job_finished(
         db,
         node_id=assigned_node_id,
-        exclude_job_id=job.id,
-    ):
-        mark_node_status(db, node_id=assigned_node_id, status=NodeStatus.IDLE.value)
+        job_id=job.id,
+    )
 
     db.commit()
     db.refresh(job)

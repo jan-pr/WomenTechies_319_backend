@@ -49,6 +49,13 @@ def _request(
     raise RuntimeError(f"request failed after {MAX_RETRIES} attempts: {last_error}")
 
 
+def _agent_headers(config: AgentConfig) -> dict[str, str]:
+    headers = {"X-Node-Id": config.node_id}
+    if config.session_token:
+        headers["X-Node-Session-Token"] = config.session_token
+    return headers
+
+
 def register_node(config: AgentConfig, node_data: dict[str, Any]) -> dict[str, Any]:
     """Register this node with the backend."""
     response = _request(
@@ -77,6 +84,7 @@ def send_heartbeat(
         "POST",
         f"{config.backend_url}/nodes/{node_id}/heartbeat",
         timeout=config.request_timeout_seconds,
+        headers=_agent_headers(config),
         json=payload,
     )
     return response.json()
@@ -89,6 +97,7 @@ def poll_job(config: AgentConfig, node_id: str) -> dict[str, Any]:
         f"{config.backend_url}/nodes/{node_id}/poll-job",
         timeout=config.request_timeout_seconds,
         expected_statuses={200},
+        headers=_agent_headers(config),
     )
     return response.json()
 
@@ -99,6 +108,7 @@ def report_progress(config: AgentConfig, job_id: str, progress: int) -> dict[str
         "POST",
         f"{config.backend_url}/jobs/{job_id}/progress",
         timeout=config.request_timeout_seconds,
+        headers=_agent_headers(config),
         json={"progress": progress},
     )
     return response.json()
@@ -110,6 +120,7 @@ def complete_job(config: AgentConfig, job_id: str, result: Any) -> dict[str, Any
         "POST",
         f"{config.backend_url}/jobs/{job_id}/complete",
         timeout=config.request_timeout_seconds,
+        headers=_agent_headers(config),
         json={"result": result},
     )
     return response.json()
@@ -121,6 +132,7 @@ def fail_job(config: AgentConfig, job_id: str, error: str) -> dict[str, Any]:
         "POST",
         f"{config.backend_url}/jobs/{job_id}/fail",
         timeout=config.request_timeout_seconds,
+        headers=_agent_headers(config),
         json={"status": "failed", "reason": error},
     )
     return response.json()
